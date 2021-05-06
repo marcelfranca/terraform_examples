@@ -1,0 +1,154 @@
+---
+# Install k8s components on all nodes
+- hosts: all
+  become: true
+  vars_files:
+  - vars/variables.yml
+
+  tasks:
+  - name: Install Packages to apt use HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+      - gnupg2
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/debian/gpg
+      state: present
+
+  - name: Add apt stable repo
+    apt_repository:
+      repo: 'deb [arch=amd64] https://download.docker.com/linux/debian stretch stable'
+      state: present
+
+  - name: Install docker and its dependecies
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+
+  - name: Add demouser to Docker group
+    shell:
+      cmd: |-
+        cat > /etc/docker/daemon.json << EOF
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"],
+          "log-driver": "json-file",
+          "log-opts": {
+            "max-size": "100m"
+          },
+          "storage-driver": "overlay2"
+        }
+        EOF
+        mkdir -p /etc/systemd/system/docker.service.d
+
+  - name: Restart Docker
+    service:
+      name: docker
+      daemon_reload: yes
+      state: restarted
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+  
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Add apt signing for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Add repo for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+
+  - name: Install kubernetes binaries
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet
+        - kubeadm
+        - kubectl
+  
+  - name: Restart kubectl
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+
+# Initialize k8s cluster on master node
+- hosts: master
+  become: true
+  tasks:
+  - name: Debug
+    debug:
+      msg: "MASTER: {{ internal_ip }} {{ external_ip }}"
+  - name: Initialize kubernetes
+    shell:
+      cmd: |-
+        kubeadm --apiserver-advertise-address="{{ internal_ip }}" --apiserver-cert-extra-sans="{{ external_ip }}" --pod-network-cidr=10.244.0.0/16 init
+
+  - name: Setup kubeconfig for demouser
+    command: "{{ item }}"
+    with_items:
+      - mkdir -p /home/demouser/.kube
+      - cp -i /etc/kubernetes/admin.conf /home/demouser/.kube/config
+      - chown -R demouser:demouser /home/demouser/.kube
+
+  - name: Install calico pod network
+    become: false
+    command: kubectl apply -f https://docs.projectcalico.org/v3.14/manifests/calico.yaml
+
+  - name: Generate join command
+    become: false
+    command: kubeadm token create --print-join-command
+    register: join_command
+
+  - name: Copy join_command to local file
+    become: false
+    copy:
+      content: "{{ join_command.stdout }}"
+      dest: "./join-command"
+    delegate_to: localhost
+
+  - name: Fetch k8s config file
+    fetch: 
+      src: /home/demouser/.kube/config
+      dest: config
+      flat: yes
+
+# Have the worker nodes joined cluster
+- hosts: worker
+  become: true
+  tasks:
+  - name: Copy the join command to server location
+    copy: src=join-command dest=/tmp/join-command.sh mode=0777
+
+  - name: Join the node to cluster
+    command: sh /tmp/join-command.sh

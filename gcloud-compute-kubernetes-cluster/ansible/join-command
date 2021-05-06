@@ -1,0 +1,1 @@
+kubeadm join master_ip:6443 --token token     --discovery-token-ca-cert-hash sha256:
